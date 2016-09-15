@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-## Python 2.7
 """Beatcop tries to ensure that a specified process runs on exactly one node in a cluster.
 It does this by acquiring an expiring lock in Redis, which it then continually refreshes.
 If the node stops refreshing its lock for any reason (like sudden death) another will acquire the lock and launch the specified process.
@@ -8,7 +7,6 @@ Beatcop is loosely based on the locking patterns described at http://redis.io/co
 """
 
 import atexit
-import ConfigParser
 import logging
 import os
 import redis
@@ -18,17 +16,7 @@ import socket
 import subprocess
 import sys
 import time
-
-try:
-    import rediscluster
-
-    # In redis-py-cluster 0.2.0 this hasn't been renamed yet. This check can go once a newer version is released.
-    if hasattr(rediscluster, 'StrictRedisCluster'):
-        RedisCluster = rediscluster.StrictRedisCluster
-    else:
-        RedisCluster = rediscluster.RedisCluster
-except ImportError:
-    pass
+from functools import reduce
 
 
 class Lock(object):
@@ -50,11 +38,6 @@ class Lock(object):
         self.sleep = sleep
         # Instead of putting any old rubbish into the Lock's value, use our FQDN and PID
         self.value = "%s-%d" % (socket.getfqdn(), os.getpid())
-        # rediscluster does not yet implement script management
-        try:
-            self._refresh_script = self.redis.register_script(self.lua_refresh)
-        except rediscluster.exceptions.RedisClusterException:    # 'Method register_script is not possible to use in a redis cluster'
-            pass
 
     def acquire(self, block=True):
         """Acquire lock. Blocks until acquired if `block` is `True`, otherwise returns `False` if the lock could not be acquired."""
@@ -126,7 +109,7 @@ class BeatCop(object):
             log.error("Couldn't connect to Redis: %s", e.message)
             sys.exit(os.EX_NOHOST)
         # Check Redis version. The 'redis_version' key is absent in Redis Cluster, because redis_info is a dict of cluster nodes instead. In which case our Redis is definitely new enough.
-        if 'redis_version' in redis_info and reduce(lambda l,r: l*1000+r, map(int,redis_info['redis_version'].split('.'))) < 2006012:
+        if 'redis_version' in redis_info and reduce(lambda l,r: l*1000+r, list(map(int,redis_info['redis_version'].split('.')))) < 2006012:
             log.error("Redis too old. You got %s, minimum requirement is %s", redis_info['redis_version'], '2.6.12')
             sys.exit(os.EX_PROTOCOL)
         self.lockname = lockname or ("beatcop:%s" % (self.command))
@@ -210,49 +193,24 @@ class BeatCop(object):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) != 2:
-        print "Usage: %s <ini_file>" % sys.argv[0]
-        sys.exit(os.EX_USAGE)
-    config_file = sys.argv[1]
-
     logging.basicConfig(level=logging.INFO, format='%(asctime)s BeatCop: %(message)s', datefmt='%Y-%m-%d %H:%M:%S %Z')
     log = logging.getLogger()
 
-    conf = ConfigParser.SafeConfigParser()
-    conf.read(config_file)
-    sections = conf.sections()
+    if len(sys.argv) < 2:
+        log.error('You have to pass command for execution')
+        sys.exit(os.EX_USAGE)
 
-    # Config sanity check
-    if conf.has_option('redis', 'host') and conf.has_option('redis', 'startup_nodes'):
-        log.error("[redis] section of ini_file must specify one of 'host' or 'startup_nodes', not both.")
-        sys.exit(os.EX_CONFIG)
-    if not conf.has_option('redis', 'host') and not conf.has_option('redis', 'startup_nodes'):
-        log.error("[redis] section of ini_file must specify either 'host' or 'startup_nodes' section. Didn't find either.")
-        sys.exit(os.EX_CONFIG)
-
-    if conf.has_option('redis', 'host'):
-        # Single Redis mode
-        redis_host_or_startup_nodes = conf.get('redis', 'host')
-        Redis = redis.StrictRedis
-    else:
-        # Redis Cluster mode
-        redis_host_or_startup_nodes = [dict(host=node.split(':')[0], port=node.split(':')[1]) for node in conf.get('redis', 'startup_nodes').split('\n')]
-        Redis = RedisCluster
+    # Single Redis mode
+    Redis = redis.StrictRedis
 
     beatcop_kwargs = dict(
-        redis_host_or_startup_nodes=redis_host_or_startup_nodes,
-        timeout=conf.getint('beatcop', 'timeout'),
-        shell=conf.getboolean('beatcop', 'shell'),
+        redis_host_or_startup_nodes=os.getenv('BKSTG_REDIS_HOST', 'localhost'),
+        redis_port=os.getenv('BKSTG_REDIS_PORT', 6379),
+        timeout=os.getenv('BEATCOP_TIMEOUT', 5000),
+        shell=os.getenv('BEATCOP_SHELL', False),
+        lockname=os.getenv('BEATCOP_LOCKNAME', 'beatcop-celerybeat')
     )
-    if conf.has_option('redis', 'port'):
-        beatcop_kwargs.update(dict(redis_port=conf.getint('redis', 'port')))
-    if conf.has_option('redis', 'database'):
-        beatcop_kwargs.update(dict(redis_db=conf.get('redis', 'database')))
-    if conf.has_option('redis', 'password'):
-        beatcop_kwargs.update(dict(redis_password=conf.get('redis', 'password')))
-    if conf.has_option('beatcop', 'lockname'):
-        beatcop_kwargs.update(dict(lockname=conf.get('beatcop', 'lockname')))
-    beatcop = BeatCop(conf.get('beatcop', 'command'), **beatcop_kwargs)
+    beatcop = BeatCop(' '.join(sys.argv[1:]), **beatcop_kwargs)
 
     log.info("BeatCop starting on %s using lock '%s'", beatcop.lock.value, beatcop.lockname)
     beatcop.run()
